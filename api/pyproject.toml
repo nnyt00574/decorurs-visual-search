@@ -1,0 +1,26 @@
+[project]
+name = "decorurs-search-api"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi[standard]==0.137.2",
+    "open-clip-torch==2.24.0",
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "qdrant-client==1.18.0",
+    "pillow>=11.0",
+    "requests>=2.32",
+    "rembg>=2.0.59",
+    "onnxruntime>=1.18",
+    "numpy>=1.26",
+    "numba>=0.60.0",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

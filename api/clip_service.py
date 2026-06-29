@@ -1,0 +1,143 @@
+"""
+Loads an OpenCLIP model once and exposes helpers to turn furniture photos
+into (a) a similarity-search embedding and (b) a predicted material label.
+Used identically by the indexer (catalog images) and the API (a user's
+upload) so both sides are processed the exact same way.
+
+Two things happen to every image before it's embedded:
+1. Background removal + crop to the foreground bounding box, so room
+   context (floors, walls, other furniture in a customer's photo) doesn't
+   dilute the embedding. Catalog product shots get the same treatment for
+   consistency, even though most are already on a clean background.
+2. Material classification via CLIP zero-shot: the image embedding is
+   compared against a fixed set of material text prompts in the same
+   CLIP space, no separate classifier needed.
+"""
+
+import torch
+import open_clip
+from PIL import Image
+import requests
+import numpy as np
+from io import BytesIO
+from rembg import remove, new_session
+
+# ViT-L-14 instead of ViT-B-32: noticeably better at distinguishing fine
+# material/texture differences (stone veining, wood grain, base style),
+# which matters a lot in a catalog full of similarly-shaped tables in
+# different finishes. Slower than B-32, but still well under a second
+# per image on CPU -- and indexing is a one-off batch job anyway.
+MODEL_NAME = "ViT-L-14"
+PRETRAINED = "laion2b_s32b_b82k"
+VECTOR_SIZE = 768
+
+# Fixed material vocabulary classified via CLIP zero-shot, applied
+# identically to catalog images and the user's upload. Kept short and
+# mutually distinguishable rather than exhaustive -- a long, overlapping
+# label list makes zero-shot classification noisier, not more accurate.
+MATERIAL_LABELS = [
+    "marble",
+    "travertine stone",
+    "granite stone",
+    "solid wood",
+    "metal",
+    "glass",
+    "rattan or wicker",
+    "upholstered fabric",
+]
+
+# Lightweight background-removal model (~4MB) -- enough to get a usable
+# foreground bounding box without the size/latency cost of the full model.
+REMBG_MODEL = "u2netp"
+
+
+class ClipService:
+    """Singleton wrapper so the (relatively heavy) model and session are
+    loaded once per process rather than once per request or per image."""
+
+    _instance = None
+
+    def __init__(self, model_name: str = MODEL_NAME, pretrained: str = PRETRAINED):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained
+        )
+        self.model.to(self.device)
+        self.model.eval()
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self._rembg_session = new_session(REMBG_MODEL)
+        self._material_text_features = self._embed_material_labels()
+
+    @classmethod
+    def get(cls) -> "ClipService":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def _embed_material_labels(self) -> torch.Tensor:
+        prompts = [f"a furniture piece made of {label}" for label in MATERIAL_LABELS]
+        tokens = self.tokenizer(prompts).to(self.device)
+        with torch.no_grad():
+            features = self.model.encode_text(tokens)
+            features /= features.norm(dim=-1, keepdim=True)
+        return features
+
+    def crop_to_subject(self, image: Image.Image, padding_frac: float = 0.04) -> Image.Image:
+        """Removes the background and crops to the bounding box of the
+        remaining foreground. Falls back to the original image if
+        background removal fails or finds no clear foreground -- this
+        should never be the reason a search request errors out."""
+        try:
+            rgba = remove(image.convert("RGB"), session=self._rembg_session)
+        except Exception:
+            return image
+
+        alpha = np.array(rgba.split()[-1])
+        ys, xs = np.where(alpha > 16)
+        if len(xs) == 0 or len(ys) == 0:
+            return image
+
+        w, h = image.size
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        pad_x = int((x1 - x0) * padding_frac)
+        pad_y = int((y1 - y0) * padding_frac)
+
+        return image.crop((
+            max(0, x0 - pad_x),
+            max(0, y0 - pad_y),
+            min(w, x1 + pad_x),
+            min(h, y1 + pad_y),
+        ))
+
+    def analyze_image(self, image: Image.Image, crop: bool = True) -> dict:
+        """Single pass over one image: crop to the furniture subject, then
+        return both the search embedding and the predicted material --
+        computed from the same cropped image so the two stay consistent."""
+        image = image.convert("RGB")
+        if crop:
+            image = self.crop_to_subject(image)
+
+        tensor = self.preprocess(image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            image_features = self.model.encode_image(tensor)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            material_sims = (image_features @ self._material_text_features.T).squeeze(0)
+            material_probs = material_sims.softmax(dim=-1)
+
+        best_idx = int(material_probs.argmax())
+        return {
+            "vector": image_features.squeeze(0).cpu().numpy().tolist(),
+            "material": MATERIAL_LABELS[best_idx],
+            "material_confidence": float(material_probs[best_idx]),
+        }
+
+    def analyze_image_from_url(self, url: str) -> dict:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        image = Image.open(BytesIO(resp.content))
+        return self.analyze_image(image)
+
+    def analyze_image_from_bytes(self, data: bytes) -> dict:
+        image = Image.open(BytesIO(data))
+        return self.analyze_image(image)

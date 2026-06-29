@@ -1,0 +1,51 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    restart: unless-stopped
+    ports:
+      - "6333:6333" # REST
+      - "6334:6334" # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage # named volume -- avoids the bind-mount
+                                     # corruption issue Qdrant's own docs warn about
+    # No healthcheck here on purpose: Qdrant's official image ships
+    # without curl/wget (removed deliberately, for security), so any
+    # wget/curl-based healthcheck always fails and blocks every dependent
+    # service. Qdrant starts in a couple seconds anyway, and the indexer
+    # has its own retry logic for the rare case it isn't ready yet.
+
+  # One-off job: pulls the catalog and embeds it into Qdrant.
+  # Not started by `docker compose up` -- run explicitly:
+  #   docker compose run --rm indexer
+  indexer:
+    build: ./indexer
+    profiles: ["tools"]
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_URL: http://qdrant:6333
+
+  api:
+    build: ./api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  qdrant_data:
