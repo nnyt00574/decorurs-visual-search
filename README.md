@@ -179,6 +179,24 @@ docker compose down -v             # stop everything AND delete indexed data
   (`warm_models.py`, run during `docker build`), not downloaded on first
   request/run. Means larger images, but predictable container startup and
   no repeated downloads on restart.
+- **`warm_models.py` and `clip_service.py` are copied into the image
+  *before* the rest of the app code**, in their own `COPY` + `RUN` step
+  ahead of the final `COPY . .`. This keeps the multi-minute model-baking
+  layer cached across rebuilds -- editing `main.py` or any other app file
+  no longer invalidates it. Only touching `pyproject.toml`,
+  `warm_models.py`, or `clip_service.py` itself forces that layer to
+  re-run.
+- **CLIP zero-shot confidence scores are scaled by the model's learned
+  `logit_scale`** before the softmax in `clip_service.py`
+  (`analyze_image`). Raw cosine similarities across only 4-8 category
+  prompts cluster tightly (e.g. 0.24 vs 0.26), so softmax on them alone
+  produces confidences that hover near random chance (~1/n_categories)
+  regardless of the image. Multiplying by `logit_scale` first (standard
+  CLIP zero-shot practice) is what turns that into a properly peaked,
+  meaningful confidence -- without it, any confidence threshold check
+  (see `SHAPE_CONFIDENCE_THRESHOLD` / `MATERIAL_CONFIDENCE_THRESHOLD` in
+  `api/main.py`) rejects almost every search regardless of how correct
+  the classification actually is.
 - Pinned versions as of this build: `qdrant/qdrant:v1.17.1`,
   `qdrant-client==1.18.0`, `fastapi[standard]==0.137.2`, `next@^16.2.0`,
   `react@^19.2.0`, OpenCLIP `ViT-L-14` (`laion2b_s32b_b82k`). Check for
