@@ -14,6 +14,7 @@ interface Product {
   product_url: string;
   price: string;
   material: string;
+  shape: string;
   score: number;
 }
 
@@ -21,6 +22,7 @@ export default function Home() {
   const [preview, setPreview] = useState<string | null>(null);
   const [results, setResults] = useState<Product[] | null>(null);
   const [queryMaterial, setQueryMaterial] = useState<string | null>(null);
+  const [queryShape, setQueryShape] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -30,6 +32,7 @@ export default function Home() {
     setError(null);
     setResults(null);
     setQueryMaterial(null);
+    setQueryShape(null);
 
     if (!ALLOWED_TYPES.includes(file.type)) {
       setError("That file didn't make it through. Use a JPG or PNG image.");
@@ -55,6 +58,7 @@ export default function Home() {
       const data = await res.json();
       setResults(data.results);
       setQueryMaterial(data.query_material);
+      setQueryShape(data.query_shape);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong. Try again.");
     } finally {
@@ -123,7 +127,8 @@ export default function Home() {
 
       {results && results.length === 0 && (
         <p className={styles.emptyState}>
-          No close matches in the catalog yet. Try a clearer photo, or one taken from a different angle.
+          No matching tables found. If you want a custom made table, please write to{" "}
+          <a href="mailto:alok@trustic.ca">alok@trustic.ca</a> or call 780-604-5390.
         </p>
       )}
 
@@ -131,7 +136,12 @@ export default function Home() {
         <>
           <h2 className={styles.resultsHeading}>
             Closest matches
-            {queryMaterial && <span className={styles.detectedMaterial}> — detected as {queryMaterial}</span>}
+            {queryMaterial && queryShape && (
+              <span className={styles.detectedMaterial}>
+                {" "}
+                — detected as {queryShape}, {queryMaterial}
+              </span>
+            )}
           </h2>
           <div className={styles.grid}>
             {results.map((p) => (
@@ -147,7 +157,9 @@ export default function Home() {
                 </div>
                 <div className={styles.cardBody}>
                   <p className={styles.cardName}>{p.name}</p>
-                  <p className={styles.cardMaterial}>{p.material}</p>
+                  <p className={styles.cardMaterial}>
+                    {p.shape}, {p.material}
+                  </p>
                   <div className={styles.cardMeta}>
                     <p className={styles.cardPrice}>${p.price} CAD</p>
                     <span className={styles.matchTag}>{(p.score * 100).toFixed(0)}% match</span>
