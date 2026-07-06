@@ -4,9 +4,9 @@ EVERY product -- not just the first -- and upserts one Qdrant point per
 image. A customer's photo might match a side-angle or detail shot rather
 than a listing's primary image, so all of them need to be searchable.
 
-Each point also carries a predicted material label so the API can boost
-results whose material matches the uploaded photo's, not just its overall
-visual similarity.
+Each point also carries a predicted material and shape label so the API
+can filter results down to ones that actually match the uploaded photo's
+material and tabletop shape, not just its overall visual similarity.
 
 Safe to re-run from scratch -- it recreates the collection each time,
 which is fine at this catalog size.
@@ -57,6 +57,7 @@ def main():
                     "product_url": item["product_url"],
                     "price": item["price"],
                     "material": analysis["material"],
+                    "shape": analysis["shape"],
                 }
                 points.append(PointStruct(id=point_id, vector=analysis["vector"], payload=payload))
             except Exception as e:

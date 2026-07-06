@@ -13,7 +13,7 @@ Docker. Catalog indexing runs as a one-off job in the same Compose stack.
 | Vector DB   | Qdrant v1.17 (server mode, persistent volume)     |
 | Embeddings  | OpenCLIP ViT-L-14 (laion2b)                       |
 | Preprocess  | rembg background removal + crop-to-subject        |
-| Matching    | cosine similarity + CLIP zero-shot material boost  |
+| Matching    | cosine similarity, hard-filtered by CLIP zero-shot material + shape |
 | API         | FastAPI 0.137 (async, lifespan, Pydantic models)  |
 | Frontend    | Next.js 16.2 / React 19 (App Router, Turbopack)   |
 | Python deps | uv + pyproject.toml                               |
@@ -28,15 +28,23 @@ Docker. Catalog indexing runs as a one-off job in the same Compose stack.
    match.
 3. Each image is also run through CLIP zero-shot classification against
    a fixed material vocabulary (marble, travertine, wood, metal, glass,
-   etc.) — no separate classifier, just comparing the same image
-   embedding against material text prompts in CLIP's shared space.
-4. At search time: pull the top 50 candidate images from Qdrant, collapse
-   down to one (best-scoring) point per product, then re-rank with a
-   small score boost for products whose material matches the upload's,
-   before returning the top 10.
+   etc.) and a fixed shape vocabulary (rectangular, square, round, oval)
+   — no separate classifiers, just comparing the same image embedding
+   against material/shape text prompts in CLIP's shared space.
+4. At search time: query Qdrant for the top 50 candidate images that
+   *also* match the upload's predicted material AND shape (a hard
+   filter applied inside Qdrant, not a post-hoc re-rank), collapse down
+   to one (best-scoring) point per product, then return the top 10 by
+   cosine similarity. A round table or a table in a different material
+   is excluded from the candidate pool entirely — it can't surface just
+   because it happens to look visually similar overall.
+5. If no catalog product matches both the material and shape, `results`
+   comes back empty and the UI shows a "no matching tables" message with
+   a custom-order contact.
 
-The detected material is returned in the API response (`query_material`,
-plus a `material` field per result) and shown in the UI.
+The detected material and shape are returned in the API response
+(`query_material`, `query_shape`, plus `material`/`shape` fields per
+result) and shown in the UI.
 
 ## Ablation study
 
@@ -120,10 +128,15 @@ docker compose run --rm indexer
 
 Model weights are now baked into the image at build time (see Dockerfile),
 so this won't re-download anything -- it goes straight to embedding. It
-embeds every image of every product, classifies each image's material,
-and upserts one Qdrant point per image. Ends with something like
-`Indexed 180 images across 63 products. Failed: 0`. Re-run any time the
-catalog changes.
+embeds every image of every product, classifies each image's material
+and shape, and upserts one Qdrant point per image. Ends with something
+like `Indexed 180 images across 63 products. Failed: 0`. Re-run any time
+the catalog changes.
+
+**Note:** shape was added after the original index was built. If you're
+upgrading an existing deployment, re-run this step once so every point
+gets a `shape` payload field — otherwise the API's material+shape filter
+will exclude everything indexed before this change.
 
 ## 4. Use it
 

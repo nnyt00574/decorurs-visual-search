@@ -46,6 +46,17 @@ MATERIAL_LABELS = [
     "upholstered fabric",
 ]
 
+# Tabletop shape, classified the same zero-shot way as material. This is
+# what lets the API tell a rectangular dining table apart from a round
+# table or a square one -- without it, search only knows "looks similar
+# overall" and happily mixes shapes together.
+SHAPE_LABELS = [
+    "rectangular",
+    "square",
+    "round",
+    "oval",
+]
+
 # Lightweight background-removal model (~4MB) -- enough to get a usable
 # foreground bounding box without the size/latency cost of the full model.
 REMBG_MODEL = "u2netp"
@@ -67,6 +78,7 @@ class ClipService:
         self.tokenizer = open_clip.get_tokenizer(model_name)
         self._rembg_session = new_session(REMBG_MODEL)
         self._material_text_features = self._embed_material_labels()
+        self._shape_text_features = self._embed_shape_labels()
 
     @classmethod
     def get(cls) -> "ClipService":
@@ -76,6 +88,14 @@ class ClipService:
 
     def _embed_material_labels(self) -> torch.Tensor:
         prompts = [f"a furniture piece made of {label}" for label in MATERIAL_LABELS]
+        tokens = self.tokenizer(prompts).to(self.device)
+        with torch.no_grad():
+            features = self.model.encode_text(tokens)
+            features /= features.norm(dim=-1, keepdim=True)
+        return features
+
+    def _embed_shape_labels(self) -> torch.Tensor:
+        prompts = [f"a table with a {label} top" for label in SHAPE_LABELS]
         tokens = self.tokenizer(prompts).to(self.device)
         with torch.no_grad():
             features = self.model.encode_text(tokens)
@@ -122,14 +142,20 @@ class ClipService:
         with torch.no_grad():
             image_features = self.model.encode_image(tensor)
             image_features /= image_features.norm(dim=-1, keepdim=True)
-            material_sims = (image_features @ self._material_text_features.T).squeeze(0)
+            logit_scale = self.model.logit_scale.exp()
+            material_sims = logit_scale * (image_features @ self._material_text_features.T).squeeze(0)
             material_probs = material_sims.softmax(dim=-1)
+            shape_sims = logit_scale * (image_features @ self._shape_text_features.T).squeeze(0)
+            shape_probs = shape_sims.softmax(dim=-1)
 
-        best_idx = int(material_probs.argmax())
+        best_material_idx = int(material_probs.argmax())
+        best_shape_idx = int(shape_probs.argmax())
         return {
             "vector": image_features.squeeze(0).cpu().numpy().tolist(),
-            "material": MATERIAL_LABELS[best_idx],
-            "material_confidence": float(material_probs[best_idx]),
+            "material": MATERIAL_LABELS[best_material_idx],
+            "material_confidence": float(material_probs[best_material_idx]),
+            "shape": SHAPE_LABELS[best_shape_idx],
+            "shape_confidence": float(shape_probs[best_shape_idx]),
         }
 
     def analyze_image_from_url(self, url: str) -> dict:

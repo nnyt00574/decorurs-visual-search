@@ -12,12 +12,14 @@ WORKDIR /app
 COPY pyproject.toml ./
 RUN uv sync --no-install-project
 
+# Copy only the files warm_models.py needs (itself + clip_service.py, which
+# only imports third-party packages) so later app-code changes don't bust
+# this layer -- it downloads/bakes several hundred MB of model weights.
+COPY warm_models.py clip_service.py ./
+RUN uv run python warm_models.py
+
 COPY . .
 RUN uv sync
-
-# Bakes the CLIP and background-removal model weights into this layer
-# instead of re-downloading several hundred MB on every container start.
-RUN uv run python warm_models.py
 
 EXPOSE 8000
 
