@@ -14,7 +14,6 @@ which is fine at this catalog size.
 
 import json
 import os
-import re
 import uuid
 
 from qdrant_client import QdrantClient
@@ -25,27 +24,6 @@ from clip_service import ClipService, VECTOR_SIZE
 
 COLLECTION_NAME = "decorurs_products"
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-
-# Product titles are human-written and often state the tabletop shape
-# directly ("Custom Made Rectangular Travertine Dining Table"). That's
-# far more reliable than CLIP's zero-shot guess, which has shown real
-# misclassifications independent of actual shape. Trust the title when
-# it's unambiguous; only fall back to CLIP when the title doesn't
-# mention a shape at all, or mentions more than one.
-SHAPE_KEYWORDS = {
-    "round": "round",
-    "circular": "round",
-    "rectangular": "rectangular",
-    "rectangle": "rectangular",
-    "square": "square",
-    "oval": "oval",
-}
-
-
-def shape_from_name(name: str) -> str | None:
-    lowered = name.lower()
-    found = {shape for kw, shape in SHAPE_KEYWORDS.items() if re.search(rf"\b{kw}\b", lowered)}
-    return found.pop() if len(found) == 1 else None
 
 
 def main():
@@ -68,15 +46,10 @@ def main():
     progress = tqdm(total=total_images, desc="Embedding product images")
 
     for item in catalog:
-        title_shape = shape_from_name(item["name"])
         for image_url in item["image_urls"]:
             try:
                 analysis = clip.analyze_image_from_url(image_url)
-                # Keyed on product_id + image_url, not just image_url --
-                # two products (e.g. a duplicated "-copy" listing) sharing
-                # the same photo would otherwise collide onto the same
-                # Qdrant point ID and silently overwrite each other.
-                point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{item['product_id']}:{image_url}"))
+                point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, image_url))
                 payload = {
                     "product_id": item["product_id"],
                     "name": item["name"],
@@ -84,7 +57,7 @@ def main():
                     "product_url": item["product_url"],
                     "price": item["price"],
                     "material": analysis["material"],
-                    "shape": title_shape or analysis["shape"],
+                    "shape": analysis["shape"],
                 }
                 points.append(PointStruct(id=point_id, vector=analysis["vector"], payload=payload))
             except Exception as e:
