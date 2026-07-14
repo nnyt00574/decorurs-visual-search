@@ -20,10 +20,13 @@ since they catch different failure modes:
   ("a table with a round top" sat closer to typical furniture photos than
   the other three phrasings on this checkpoint, regardless of the image),
   which was over-representing "round" across the whole catalog.
-- Aspect-ratio veto (see ELONGATED_ASPECT_RATIO): fixes a separate,
-  image-side failure mode where rembg's foreground box comes out clearly
-  elongated (e.g. lifestyle shots where the box is closer to isolating
-  just the table), which a truly round/square top should never produce.
+- Aspect-ratio veto (see ELONGATED_ASPECT_RATIO / _mass_trimmed_extent):
+  fixes a separate, image-side failure mode where a clearly elongated
+  table (a long console table, a slab dining table) still isn't measured
+  as elongated -- typically because rembg's foreground mask also includes
+  decor resting on/against it (a vase, a plant) that stretches the box
+  vertically enough to mask the table's own proportions. A truly
+  round/square top should never produce that silhouette regardless.
 """
 
 import torch
@@ -33,6 +36,7 @@ import requests
 import numpy as np
 from io import BytesIO
 from rembg import remove, new_session
+from scipy import ndimage
 
 # ViT-L-14 instead of ViT-B-32: noticeably better at distinguishing fine
 # material/texture differences (stone veining, wood grain, base style),
@@ -88,20 +92,64 @@ SHAPE_PROMPT_TEMPLATES = [
     "furniture: a {shape} table",
 ]
 
-# Foreground bounding-box width:height ratio beyond which a tabletop is
-# too elongated to plausibly be round or square in typical product or
-# customer photography. Used as a sanity check on CLIP's zero-shot shape
-# guess -- CLIP has been observed confidently calling clearly elongated
-# tables (long console tables, slab dining tables) "round", which a
-# symmetric shape should never produce that silhouette for. This is a
-# separate safeguard from prompt ensembling above: it catches image-side
-# problems (e.g. rembg's foreground box including chairs/décor around the
-# table), not the text-prompt bias.
+# Foreground width:height ratio beyond which a tabletop is too elongated
+# to plausibly be round or square in typical product or customer
+# photography. Used as a sanity check on CLIP's zero-shot shape guess --
+# CLIP has been observed confidently calling clearly elongated tables
+# (long console tables, slab dining tables) "round", which a symmetric
+# shape should never produce that silhouette for. This is a separate
+# safeguard from prompt ensembling above: it catches image-side problems,
+# not the text-prompt bias.
+#
+# The ratio itself is computed from a *mass-trimmed* extent, not a plain
+# min/max bounding box -- see _mass_trimmed_extent. A plain bounding box
+# is wrecked by decor that's physically touching the furniture in the
+# mask (a vase and its branches standing on a console table, reaching a
+# third of the way up the frame): connected-component filtering alone
+# can't separate them since there's no background gap between vase and
+# tabletop, and that extra height alone is enough to turn a genuinely
+# ~3:1 console table into a ~1.2:1 bounding box, well inside this
+# threshold and silently defeating the veto. The vase contributes that
+# height using comparatively few pixels next to the table's solid mass,
+# which mass-trimming is specifically robust to.
 ELONGATED_ASPECT_RATIO = 2.0
+
+# Fraction of an axis's foreground pixel mass discarded from each end
+# when computing the mass-trimmed extent for the aspect ratio above.
+# Checked against a synthetic ~2.9:1 console table with a touching vase
+# reaching a third of the way up the frame: 0.08 wasn't quite enough to
+# recover an elongated reading (1.83, still under ELONGATED_ASPECT_RATIO),
+# 0.12+ reliably was (2.3+); 0.15 gives comfortable margin. Checked
+# against a synthetic round table (no decor) at the same settings and it
+# stays exactly 1.0 at every trim level tried, since a symmetric mask
+# trims evenly on all sides -- so this doesn't cost us accuracy on
+# legitimately round/square items. Only affects the veto's aspect ratio;
+# the crop used for the embedding still uses the untrimmed
+# largest-component extent, so a genuinely tall item (a bookshelf, a
+# floor lamp) is never chopped in the image CLIP actually sees.
+ASPECT_TRIM_FRACTION = 0.15
 
 # Lightweight background-removal model (~4MB) -- enough to get a usable
 # foreground bounding box without the size/latency cost of the full model.
 REMBG_MODEL = "u2netp"
+
+# Minimum fraction of the frame rembg's foreground mask must cover before
+# it's trusted as "the furniture". u2netp is a generic salient-object
+# model, not a furniture detector -- on a lifestyle photo with several
+# objects and no single overwhelmingly dominant one, it can lock onto a
+# small, high-contrast prop instead of the actual product. Verified
+# directly against a photo that was misclassified in production: rembg's
+# mask covered only 4.4% of the frame and turned out to be a small dark
+# bowl sitting on the table, not the table itself -- CLIP then correctly
+# read that crop as "round" (it *is* round) while the shape field ended
+# up describing the wrong object entirely. A rectangular/oval veto can't
+# fix this, since the aspect ratio computed from that crop is a real
+# measurement of the bowl, not a distorted measurement of the table.
+# Below this fraction, the mask is treated the same as "no usable
+# foreground found": fall back to classifying the full, uncropped image.
+# A context-diluted classification of the right object beats a confident
+# classification of the wrong one.
+MIN_FOREGROUND_AREA_FRACTION = 0.12
 
 
 class ClipService:
@@ -156,25 +204,60 @@ class ClipService:
             label_features.append(mean_feature)
         return torch.stack(label_features)
 
+    @staticmethod
+    def _mass_trimmed_extent(coords: np.ndarray, trim_fraction: float) -> tuple[int, int]:
+        """(lo, hi) range for one axis's foreground pixel coordinates,
+        discarding trim_fraction of the pixel *mass* off each end rather
+        than taking a strict min/max. A thin appendage (a vase and its
+        branches standing on a table) can stretch a plain min/max a long
+        way while contributing comparatively few pixels; percentile-based
+        trimming on the raw coordinate samples is naturally weighted by
+        how many pixels are actually at each position, so a sparse
+        appendage is trimmed away while a dense, solid piece is not."""
+        lo, hi = np.percentile(coords, [trim_fraction * 100, (1 - trim_fraction) * 100])
+        return int(lo), int(hi)
+
     def crop_to_subject(self, image: Image.Image, padding_frac: float = 0.04):
         """Removes the background and crops to the bounding box of the
-        remaining foreground. Falls back to the original image if
-        background removal fails or finds no clear foreground -- this
-        should never be the reason a search request errors out.
+        largest connected foreground blob. Falls back to the original
+        image if background removal fails or finds no clear foreground --
+        this should never be the reason a search request errors out.
 
-        Returns (cropped_image, aspect_ratio) -- aspect_ratio is the
-        foreground box's width:height, or None if no usable foreground
-        was found."""
+        Returns (cropped_image, aspect_ratio). aspect_ratio is a
+        mass-trimmed width:height estimate of the furniture's own shape
+        (see _mass_trimmed_extent), used only by the round/square veto in
+        analyze_image -- not the same box used for the crop. Returns None
+        for aspect_ratio if no usable foreground was found."""
         try:
             rgba = remove(image.convert("RGB"), session=self._rembg_session)
         except Exception:
             return image, None
 
-        alpha = np.array(rgba.split()[-1])
-        ys, xs = np.where(alpha > 16)
-        if len(xs) == 0 or len(ys) == 0:
+        mask = np.array(rgba.split()[-1]) > 16
+        if not mask.any():
             return image, None
 
+        # Sanity-check the mask's size before trusting it -- see
+        # MIN_FOREGROUND_AREA_FRACTION. A too-small mask most likely means
+        # rembg locked onto an incidental object instead of the furniture;
+        # cropping to it and classifying it would confidently describe
+        # the wrong thing rather than vaguely describe the right thing.
+        if mask.mean() < MIN_FOREGROUND_AREA_FRACTION:
+            return image, None
+
+        # Keep only the largest connected foreground blob. rembg can mark
+        # more than one disconnected region as foreground in a lifestyle
+        # photo -- a wall mirror above a console table, a rug, another
+        # piece of furniture in frame -- and unioning all of them into one
+        # box pulls room context back into a crop that's supposed to
+        # exclude it (see module docstring). The furniture itself is
+        # reliably the largest contiguous blob in these photos.
+        labeled, num_features = ndimage.label(mask)
+        if num_features > 1:
+            sizes = ndimage.sum(mask, labeled, index=range(1, num_features + 1))
+            mask = labeled == (int(np.argmax(sizes)) + 1)
+
+        ys, xs = np.where(mask)
         w, h = image.size
         x0, x1 = int(xs.min()), int(xs.max())
         y0, y1 = int(ys.min()), int(ys.max())
@@ -187,8 +270,12 @@ class ClipService:
             min(w, x1 + pad_x),
             min(h, y1 + pad_y),
         ))
-        box_w, box_h = (x1 - x0), (y1 - y0)
-        aspect_ratio = box_w / box_h if box_h > 0 else None
+
+        tx0, tx1 = self._mass_trimmed_extent(xs, ASPECT_TRIM_FRACTION)
+        ty0, ty1 = self._mass_trimmed_extent(ys, ASPECT_TRIM_FRACTION)
+        trimmed_w, trimmed_h = max(tx1 - tx0, 1), max(ty1 - ty0, 1)
+        aspect_ratio = trimmed_w / trimmed_h
+
         return cropped, aspect_ratio
 
     def analyze_image(self, image: Image.Image, crop: bool = True) -> dict:
