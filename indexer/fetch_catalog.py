@@ -13,13 +13,34 @@ import requests
 
 BASE_URL = "https://decorurs.com/collections/all/products.json"
 
+# The storefront endpoint is unauthenticated and can rate-limit bursts of
+# requests (e.g. re-running the indexer a few times in a row while
+# iterating locally). A single 429 shouldn't kill the whole job -- retry
+# with backoff first, respecting the server's own Retry-After header when
+# it sends one.
+MAX_RETRIES = 5
+BACKOFF_SECONDS = 5  # doubled on each subsequent retry
+
+
+def _get_with_retry(url: str, params: dict) -> requests.Response:
+    resp = None
+    for attempt in range(MAX_RETRIES):
+        resp = requests.get(url, params=params)
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return resp
+        wait = int(resp.headers.get("Retry-After", BACKOFF_SECONDS * (2 ** attempt)))
+        print(f"Rate limited (429), attempt {attempt + 1}/{MAX_RETRIES} -- waiting {wait}s")
+        time.sleep(wait)
+    resp.raise_for_status()  # retries exhausted: surface the last response's error
+    return resp
+
 
 def fetch_all_products() -> list[dict]:
     products = []
     page = 1
     while True:
-        resp = requests.get(BASE_URL, params={"limit": 250, "page": page})
-        resp.raise_for_status()
+        resp = _get_with_retry(BASE_URL, {"limit": 250, "page": page})
         batch = resp.json().get("products", [])
         if not batch:
             break
