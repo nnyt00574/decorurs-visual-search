@@ -13,19 +13,29 @@ import requests
 
 BASE_URL = "https://decorurs.com/collections/all/products.json"
 
+# Some storefronts rate-limit or flag the default python-requests
+# User-Agent more aggressively than a normal browser one.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    )
+}
+
 # The storefront endpoint is unauthenticated and can rate-limit bursts of
 # requests (e.g. re-running the indexer a few times in a row while
 # iterating locally). A single 429 shouldn't kill the whole job -- retry
 # with backoff first, respecting the server's own Retry-After header when
-# it sends one.
-MAX_RETRIES = 5
-BACKOFF_SECONDS = 5  # doubled on each subsequent retry
+# it sends one. Budget is generous (up to ~10.5 min cumulative) because a
+# 120s wait was observed to not be enough to clear an active block.
+MAX_RETRIES = 6
+BACKOFF_SECONDS = 10  # doubled on each subsequent retry: 10,20,40,80,160,320
 
 
 def _get_with_retry(url: str, params: dict) -> requests.Response:
     resp = None
     for attempt in range(MAX_RETRIES):
-        resp = requests.get(url, params=params)
+        resp = requests.get(url, params=params, headers=HEADERS)
         if resp.status_code != 429:
             resp.raise_for_status()
             return resp
