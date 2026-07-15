@@ -1,20 +1,17 @@
-# Python
+# Environment variables
+.env
+.env.local
+*.env
+
+# Python and Virtual Environments
+.venv/
+venv/
 __pycache__/
 *.pyc
-.venv/
-*.egg-info/
 
-# Node / Next.js
-node_modules/
-.next/
-
-# Generated at runtime -- not source
+# Data dumps (You probably don't want to upload the entire catalog JSON)
 catalog.json
-qdrant_local_data/
 
-# Env files (commit .env.example, never .env)
-.env
-.env.*.local
-
-# OS noise
-.DS_Store
+# Next.js and Node builds
+.next/
+node_modules/.DS_Store
