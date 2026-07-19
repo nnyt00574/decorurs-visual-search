@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -67,8 +68,96 @@ class ProductResult(BaseModel):
 
 class SearchResponse(BaseModel):
     results: list[ProductResult]
-    query_material: str
-    query_shape: str
+    query_material: str | None
+    query_shape: str | None
+
+
+class TextSearchRequest(BaseModel):
+    query: str
+
+
+MAX_QUERY_LENGTH = 300
+
+# Free-form text ("a round marble coffee table for a small condo") can't be
+# zero-shot classified against material/shape prompts the same reliable way
+# an *image* can -- CLIP's text encoder comparing one phrase to another is a
+# noisier signal than comparing a photo to a phrase, since the model was
+# trained on image-text pairs, not text-text pairs. Instead of trusting that
+# comparison, this does plain keyword matching against a few synonyms per
+# label. It's simple and transparent: if the shopper's own words name a
+# material or shape, use it as a hard filter (same as the image path); if
+# they don't, skip the filter entirely and fall back to pure semantic
+# similarity across the whole catalog rather than force a guess.
+MATERIAL_KEYWORDS = {
+    "marble": "marble",
+    "travertine": "travertine stone",
+    "granite": "granite stone",
+    "wood": "solid wood",
+    "wooden": "solid wood",
+    "hardwood": "solid wood",
+    "oak": "solid wood",
+    "walnut": "solid wood",
+    "metal": "metal",
+    "steel": "metal",
+    "iron": "metal",
+    "glass": "glass",
+    "rattan": "rattan or wicker",
+    "wicker": "rattan or wicker",
+    "upholstered": "upholstered fabric",
+    "fabric": "upholstered fabric",
+}
+
+SHAPE_KEYWORDS = {
+    "rectangular": "rectangular",
+    "rectangle": "rectangular",
+    "square": "square",
+    "round": "round",
+    "circular": "round",
+    "circle": "round",
+    "oval": "oval",
+    "elliptical": "oval",
+}
+
+
+def _keyword_match(query: str, keywords: dict[str, str]) -> str | None:
+    lowered = query.lower()
+    for keyword, label in keywords.items():
+        if keyword in lowered:
+            return label
+    return None
+
+
+def _rank_and_format(points, query_material: str | None, query_shape: str | None) -> SearchResponse:
+    """Shared by both search paths: collapse multiple matched images down
+    to one (best-scoring) point per product, rank by score, and shape the
+    response -- identical logic regardless of whether the query was an
+    uploaded photo or typed/spoken text."""
+    best_by_product = {}
+    for point in points:
+        pid = point.payload["product_id"]
+        if pid not in best_by_product or point.score > best_by_product[pid].score:
+            best_by_product[pid] = point
+
+    ranked = sorted(best_by_product.values(), key=lambda p: p.score, reverse=True)
+    top = ranked[:RESULTS_TO_RETURN]
+
+    return SearchResponse(
+        query_material=query_material,
+        query_shape=query_shape,
+        results=[
+            ProductResult(
+                product_id=point.payload["product_id"],
+                name=point.payload["name"],
+                image_url=point.payload["image_url"],
+                product_url=point.payload["product_url"],
+                price=point.payload["price"],
+                material=point.payload["material"],
+                shape=point.payload["shape"],
+                score=round(point.score, 4),
+            )
+            for point in top
+        ],
+    )
 
 
 @asynccontextmanager
@@ -146,30 +235,57 @@ async def search(file: UploadFile = File(...)):
     # Multiple points can belong to the same product (one per catalog
     # image) -- keep only the best-scoring point per product before
     # ranking, so one heavily-photographed product can't crowd out others.
-    best_by_product = {}
-    for point in result.points:
-        pid = point.payload["product_id"]
-        if pid not in best_by_product or point.score > best_by_product[pid].score:
-            best_by_product[pid] = point
+    return _rank_and_format(result.points, query_material, query_shape)
 
-    ranked = sorted(best_by_product.values(), key=lambda p: p.score, reverse=True)
-    top = ranked[:RESULTS_TO_RETURN]
 
-    return SearchResponse(
-        query_material=query_material,
-        query_shape=query_shape,
-        results=[
-            ProductResult(
-                product_id=point.payload["product_id"],
-                name=point.payload["name"],
-                image_url=point.payload["image_url"],
-                product_url=point.payload["product_url"],
-                price=point.payload["price"],
-                material=point.payload["material"],
-                shape=point.payload["shape"],
-                score=round(point.score, 4),
-            )
-            for point in top
-        ],
+@app.post("/search/text", response_model=SearchResponse)
+async def search_text(payload: TextSearchRequest):
+    """Powers the chat widget's typed/spoken queries. Embeds the query with
+    CLIP's text encoder into the same space product images live in, so a
+    description like "round marble coffee table" is matched directly
+    against catalog image embeddings -- the same mechanism as the photo
+    upload path, just with a text encoder instead of an image encoder."""
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Please enter a description to search for")
+    if len(query) > MAX_QUERY_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Keep queries under {MAX_QUERY_LENGTH} characters")
+
+    try:
+        vector = await run_in_threadpool(app.state.clip.embed_text, query)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not process that query")
+
+    # Only filter on material/shape if the shopper's own words name one --
+    # see MATERIAL_KEYWORDS/SHAPE_KEYWORDS above for why this is keyword
+    # matching rather than zero-shot classification for text queries.
+    detected_material = _keyword_match(query, MATERIAL_KEYWORDS)
+    detected_shape = _keyword_match(query, SHAPE_KEYWORDS)
+
+    must = []
+    if detected_material:
+        must.append(FieldCondition(key="material", match=MatchValue(value=detected_material)))
+    if detected_shape:
+        must.append(FieldCondition(key="shape", match=MatchValue(value=detected_shape)))
+    match_filter = Filter(must=must) if must else None
+
+    result = await app.state.qdrant.query_points(
+        collection_name=COLLECTION_NAME,
+        query=vector,
+        query_filter=match_filter,
+        limit=CANDIDATE_POOL_SIZE,
     )
-# cache test
+
+    # A named material/shape that genuinely isn't in the catalog should say
+    # so, same as the image path -- not silently drop the filter and show
+    # unrelated products.
+    if not result.points and must:
+        return SearchResponse(query_material=detected_material, query_shape=detected_shape, results=[])
+
+    return _rank_and_format(result.points, detected_material, detected_shape)
+
+
+# Serves the embeddable chat widget (icon + panel) at /widget/decorurs-widget.js
+# so a single deployment of this API also hosts the script a storefront
+# points to. See api/static/README.md for the <script> tag to add to Shopify.
+app.mount("/widget", StaticFiles(directory="static"), name="widget")
