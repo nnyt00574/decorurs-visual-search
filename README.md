@@ -236,3 +236,4 @@ docker compose down -v             # stop everything AND delete indexed data
 Each service still works standalone with `uv` (Python) and `npm` (frontend)
 pointed at a Qdrant instance of your choosing — just set `QDRANT_URL` and
 `NEXT_PUBLIC_API_URL` accordingly. Ask if you want that walkthrough instead.
+
