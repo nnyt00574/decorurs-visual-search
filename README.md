@@ -16,6 +16,7 @@ Docker. Catalog indexing runs as a one-off job in the same Compose stack.
 | Matching    | cosine similarity, hard-filtered by CLIP zero-shot material + shape |
 | API         | FastAPI 0.137 (async, lifespan, Pydantic models)  |
 | Frontend    | Next.js 16.2 / React 19 (App Router, Turbopack)   |
+| Storefront widget | Vanilla JS/CSS, no build step, served by the API  |
 | Python deps | uv + pyproject.toml                               |
 
 ## How matching works now
@@ -45,6 +46,33 @@ Docker. Catalog indexing runs as a one-off job in the same Compose stack.
 The detected material and shape are returned in the API response
 (`query_material`, `query_shape`, plus `material`/`shape` fields per
 result) and shown in the UI.
+
+## Searching by text, not just photo
+
+`POST /search/text` (`{"query": "a round marble coffee table"}`) matches a
+typed or spoken description directly against catalog image embeddings,
+using CLIP's text encoder to put the query in the same vector space as the
+product photos — no separate text index needed. Unlike the image path,
+material/shape filtering here is done by matching keywords in the query
+against `MATERIAL_KEYWORDS`/`SHAPE_KEYWORDS` in `api/main.py` rather than
+zero-shot classification: comparing one phrase to another in CLIP's text
+space is a noisier signal than comparing a photo to a phrase, since the
+model was trained on image-text pairs. If the query doesn't name a
+material or shape, the filter is skipped and results come from pure
+semantic similarity across the whole catalog instead of a forced guess.
+
+## Storefront chat widget
+
+`api/static/decorurs-widget.js` is a small floating icon + slide-in chat
+panel, embeddable on any storefront via one `<script>` tag — shoppers can
+type, speak (Web Speech API), or upload a photo, and get results inline as
+product cards. It's plain vanilla JS/CSS (no framework, no build step) and
+is served directly by the API at `/widget/decorurs-widget.js`, so
+deploying the API also gives you the script to embed.
+
+See **`api/static/README.md`** for the full walkthrough: local preview,
+deploying the API behind HTTPS, setting `CORS_ORIGINS`, and adding the
+`<script>` tag to a Shopify theme (decorurs.com's platform).
 
 ## Ablation study
 
@@ -83,6 +111,7 @@ decorurs-visual-search/
 ├── .env.example
 ├── indexer/        # one-off job: catalog -> embeddings -> Qdrant
 ├── api/            # FastAPI search service
+│   └── static/     # embeddable chat widget (decorurs-widget.js) + demo.html
 └── frontend/       # Next.js upload + results page
 ```
 

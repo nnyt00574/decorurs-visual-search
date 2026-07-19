@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DecorUrs Visual Search Widget — Local Preview</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: #f4f1ea;
+      font-family: system-ui, sans-serif;
+      color: #2a2620;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 2rem;
+    }
+    .card { max-width: 480px; }
+    h1 { font-size: 1.4rem; margin-bottom: .5rem; }
+    p { color: #756f63; line-height: 1.5; }
+    code { background: #e9e3d6; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Widget preview</h1>
+    <p>
+      This page stands in for decorurs.com so you can try the visual-search
+      chat widget end to end before adding it to the live storefront.
+      Look for the round icon in the bottom-right corner.
+    </p>
+    <p>
+      Talking to <code id="api-url"></code>. Change the
+      <code>data-api-url</code> attribute below if the API is running
+      somewhere else.
+    </p>
+  </div>
+
+  <!--
+    Local testing: this page is served by the API itself (see
+    api/main.py's StaticFiles mount), so the widget is pointed at
+    window.location.origin -- the same host it's already running on. On
+    the real storefront you'll hardcode the full https:// API URL
+    instead -- see api/static/README.md.
+  -->
+  <script>
+    document.getElementById("api-url").textContent = window.location.origin;
+    var s = document.createElement("script");
+    s.src = "/widget/decorurs-widget.js";
+    s.setAttribute("data-api-url", window.location.origin);
+    document.body.appendChild(s);
+  </script>
+</body>
+</html>

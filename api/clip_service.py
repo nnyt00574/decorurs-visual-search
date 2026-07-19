@@ -326,6 +326,18 @@ class ClipService:
             "shape_confidence": shape_confidence,
         }
 
+    def embed_text(self, text: str) -> list[float]:
+        """Embeds a free-form text query (e.g. "round marble coffee table")
+        into the same CLIP space as product images, via CLIP's native
+        text encoder -- this is what lets a typed or spoken description
+        be matched directly against catalog image embeddings in Qdrant,
+        the same way an uploaded photo is."""
+        tokens = self.tokenizer([text]).to(self.device)
+        with torch.no_grad():
+            features = self.model.encode_text(tokens)
+            features /= features.norm(dim=-1, keepdim=True)
+        return features.squeeze(0).cpu().numpy().tolist()
+
     def analyze_image_from_url(self, url: str) -> dict:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
