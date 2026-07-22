@@ -1,105 +1,90 @@
-"""
-Reads catalog.json (produced by fetch_catalog.py), embeds EVERY image of
-EVERY product -- not just the first -- and upserts one Qdrant point per
-image. A customer's photo might match a side-angle or detail shot rather
-than a listing's primary image, so all of them need to be searchable.
-
-Each point also carries a predicted material and shape label so the API
-can filter results down to ones that actually match the uploaded photo's
-material and tabletop shape, not just its overall visual similarity.
-
-Safe to re-run from scratch -- it recreates the collection each time,
-which is fine at this catalog size.
-"""
-
-import json
 import os
-import re
-import uuid
+import json
+import asyncio
+import requests
+from pinecone import Pinecone
+from clip_service import ServerlessClipService
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance, PointStruct
-from tqdm import tqdm
+INDEX_NAME = "decorurs-products"
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 
-from clip_service import ClipService, VECTOR_SIZE
+async def index_catalog():
+    print("Loading catalog...")
+    try:
+        with open("catalog.json", "r") as f:
+            catalog = json.load(f)
+    except FileNotFoundError:
+        print("Error: catalog.json not found. Please run your Shopify fetcher script first.")
+        return
 
-COLLECTION_NAME = "decorurs_products"
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+    print(f"Connecting to Pinecone index '{INDEX_NAME}'...")
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    # Verify the index exists, if not, you'll need to create it in the Pinecone dashboard
+    try:
+        index = pc.Index(INDEX_NAME)
+    except Exception as e:
+        print(f"Could not connect to Pinecone index: {e}")
+        return
 
-# Product titles are human-written and often state the tabletop shape
-# directly ("Custom Made Rectangular Travertine Dining Table"). That's
-# far more reliable than CLIP's zero-shot guess, which has shown real
-# misclassifications independent of actual shape. Trust the title when
-# it's unambiguous; only fall back to CLIP when the title doesn't
-# mention a shape at all, or mentions more than one.
-SHAPE_KEYWORDS = {
-    "round": "round",
-    "circular": "round",
-    "rectangular": "rectangular",
-    "rectangle": "rectangular",
-    "square": "square",
-    "oval": "oval",
-}
+    clip = ServerlessClipService.get()
+    vectors_to_upsert = []
+    
+    # We need a unique string ID for every single image vector in Pinecone
+    point_id_counter = 1
 
-
-def shape_from_name(name: str) -> str | None:
-    lowered = name.lower()
-    found = {shape for kw, shape in SHAPE_KEYWORDS.items() if re.search(rf"\b{kw}\b", lowered)}
-    return found.pop() if len(found) == 1 else None
-
-
-def main():
-    client = QdrantClient(url=QDRANT_URL)
-
-    if client.collection_exists(COLLECTION_NAME):
-        client.delete_collection(COLLECTION_NAME)
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-    )
-
-    with open("catalog.json") as f:
-        catalog = json.load(f)
-
-    clip = ClipService.get()
-    points, failed = [], []
-
-    total_images = sum(len(item["image_urls"]) for item in catalog)
-    progress = tqdm(total=total_images, desc="Embedding product images")
-
-    for item in catalog:
-        title_shape = shape_from_name(item["name"])
-        for image_url in item["image_urls"]:
+    print(f"Processing {len(catalog)} products...")
+    
+    for product in catalog:
+        print(f"Indexing: {product['name']}")
+        
+        for image_url in product.get("image_urls", []):
             try:
-                analysis = clip.analyze_image_from_url(image_url)
-                # Keyed on product_id + image_url, not just image_url --
-                # two products (e.g. a duplicated "-copy" listing) sharing
-                # the same photo would otherwise collide onto the same
-                # Qdrant point ID and silently overwrite each other.
-                point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{item['product_id']}:{image_url}"))
-                payload = {
-                    "product_id": item["product_id"],
-                    "name": item["name"],
+                # 1. Download the image from Shopify
+                resp = requests.get(image_url, timeout=10)
+                resp.raise_for_status()
+                image_bytes = resp.content
+
+                # 2. Get vector (Hugging Face) and classification (OpenAI)
+                analysis = await clip.analyze_image_from_bytes(image_bytes)
+                
+                # 3. Format the metadata for Pinecone filtering and frontend display
+                metadata = {
+                    "product_id": product["product_id"],
+                    "name": product["name"],
                     "image_url": image_url,
-                    "product_url": item["product_url"],
-                    "price": item["price"],
+                    "product_url": product["product_url"],
+                    "price": str(product["price"]), # Pinecone metadata prefers strings/numbers
                     "material": analysis["material"],
-                    "shape": title_shape or analysis["shape"],
+                    "shape": analysis["shape"]
                 }
-                points.append(PointStruct(id=point_id, vector=analysis["vector"], payload=payload))
+
+                # 4. Append to our batch
+                vectors_to_upsert.append({
+                    "id": f"img_{point_id_counter}",
+                    "values": analysis["vector"],
+                    "metadata": metadata
+                })
+                
+                point_id_counter += 1
+
+                # 5. Batch upsert every 50 vectors (saves network requests)
+                if len(vectors_to_upsert) >= 50:
+                    print(f"Upserting batch of {len(vectors_to_upsert)} vectors to Pinecone...")
+                    index.upsert(vectors=vectors_to_upsert)
+                    vectors_to_upsert = []
+                    
             except Exception as e:
-                failed.append((item["name"], image_url, str(e)))
-            progress.update(1)
+                print(f"Failed to process image {image_url}: {e}")
 
-    progress.close()
+    # Upsert any remaining vectors left in the list
+    if vectors_to_upsert:
+        print(f"Upserting final batch of {len(vectors_to_upsert)} vectors to Pinecone...")
+        index.upsert(vectors=vectors_to_upsert)
 
-    if points:
-        client.upsert(collection_name=COLLECTION_NAME, points=points)
-
-    print(f"Indexed {len(points)} images across {len(catalog)} products. Failed: {len(failed)}")
-    for name, url, err in failed:
-        print(f"  FAILED: {name} ({url}) -> {err}")
-
+    print(f"Indexing complete! Successfully processed {point_id_counter - 1} total images.")
 
 if __name__ == "__main__":
-    main()
+    # Because our ServerlessClipService relies on async calls to OpenAI, 
+    # we run the indexer inside an asyncio event loop.
+    asyncio.run(index_catalog())
